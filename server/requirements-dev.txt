@@ -1,0 +1,3 @@
+# 개발·테스트할 때만 필요하다. 서버만 실행할 때는 requirements.txt만 설치하면 된다.
+-r requirements.txt
+pytest==9.2.0
