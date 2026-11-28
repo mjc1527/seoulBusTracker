@@ -70,3 +70,20 @@ def bearing_deg(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     #    도로 바꾼 뒤 음수를 없애 0 이상 360 미만의 방위각(도)을 반환한다. (-90 → 270)
     theta = math.atan2(x, y)
     return (math.degrees(theta) + 360) % 360
+
+
+def is_stopped(
+    lat1: float, lng1: float, lat2: float, lng2: float, threshold_m: float = 10.0
+) -> bool:
+    """이전 좌표와 지금 좌표 사이의 거리가 기준보다 짧으면 정차로 판정하는 함수
+
+        정차    distance_m(이전, 지금) < threshold_m
+        이동    distance_m(이전, 지금) >= threshold_m
+
+    threshold_m은 정차로 볼 거리 기준(m)이다. 기본값 10 m는 임시 값이며,
+    실제 관측 데이터를 쌓은 뒤 정한다.
+
+    거리만 보고 판정한다. 두 좌표의 시간 간격과 정차한 이유(정류소, 신호, 정체)는
+    구분하지 않는다.
+    """
+    return distance_m(lat1, lng1, lat2, lng2) < threshold_m
