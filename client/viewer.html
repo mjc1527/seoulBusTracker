@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seoul bus viewer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#fff; --fg:#1f2328; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --fg:#e6e8eb; --muted:#9aa3af; --line:#2c3038; --accent:#60a5fa; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+           padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; }
+  form { display: flex; gap: 6px; }
+  input { width: 130px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--fg); font: inherit; }
+  button { padding: 6px 12px; border: 0; border-radius: 6px; background: var(--accent);
+           color: #fff; font: inherit; cursor: pointer; }
+  #status { color: var(--muted); }
+  #status.err { color: #dc2626; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #map { flex: 1; }
+  aside { width: 270px; overflow-y: auto; border-left: 1px solid var(--line); }
+  aside .item { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  aside .item:hover { background: rgba(127,127,127,.12); }
+  aside .plate { font-weight: 600; }
+  aside .meta { color: var(--muted); font-size: 12px; }
+  aside .empty { padding: 14px; color: var(--muted); }
+  footer { padding: 4px 14px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--line); }
+  @media (max-width: 700px) { main { flex-direction: column; } aside { width: auto; height: 35%; border-left: 0; border-top: 1px solid var(--line); } }
+
+  /* 버스 마커: 진행 방향(bearing)만큼 회전하는 화살표 */
+  .bus { background: none; border: 0; }
+  .arrow { width: 28px; height: 28px; color: #6b7280; filter: drop-shadow(0 1px 2px rgba(0,0,0,.45)); }
+  .arrow svg { width: 100%; height: 100%; fill: currentColor; stroke: #fff; stroke-width: 1.5; }
+  .arrow[data-state="moving"]  { color: #16a34a; }
+  .arrow[data-state="stopped"] { color: #dc2626; }
+  .arrow.nobearing svg { display: none; }
+  .arrow.nobearing { width: 14px; height: 14px; margin: 7px; border-radius: 50%;
+                     background: currentColor; border: 2px solid #fff; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 3px 0 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Seoul bus viewer</h1>
+  <form id="form">
+    <input id="route" placeholder="9-digit route ID" inputmode="numeric" maxlength="9" autocomplete="off">
+    <button>Show</button>
+  </form>
+  <span id="status">Enter a route ID (busRouteId).</span>
+  <span class="legend">
+    <i style="background:#16a34a"></i>moving <i style="background:#dc2626"></i>stopped
+    <i style="background:#6b7280"></i>unknown / parked
+  </span>
+</header>
+<main>
+  <div id="map"></div>
+  <aside id="list"><div class="empty">No route selected.</div></aside>
+</main>
+<footer>Bus data: 서울특별시 버스위치정보조회 서비스 (공공데이터포털). Map: © OpenStreetMap contributors © CARTO.</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = "http://127.0.0.1:8000";   // FastAPI 프록시 주소
+const POLL_MS = 15000;                 // 프록시의 15초 캐시 주기와 맞춤
+const MOVE_MS = 4000;                  // 갱신 후 마커가 부드럽게 이동하는 시간(ms)
+
+const map = L.map("map").setView([37.5665, 126.978], 12);
+// CARTO 지도는 이제 무료 API 키가 필요함 (carto.com/basemaps/apikey). 여기에 붙여넣기.
+// 키가 비어 있으면 기본 OpenStreetMap 타일로 대체됨 (로컬 테스트용으로 충분).
+const CARTO_KEY = "";
+const OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+if (CARTO_KEY) {
+  L.tileLayer(`https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}{r}.png?key=${CARTO_KEY}`, {
+    maxNativeZoom: 18, maxZoom: 20,
+    attribution: OSM_ATTR + ', &copy; <a href="https://carto.com/attribution/">CARTO</a>',
+  }).addTo(map);
+} else {
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: OSM_ATTR }).addTo(map);
+}
+
+const $ = (id) => document.getElementById(id);
+const buses = new Map();               // vehId -> {marker, arrow, data, target, anim, dataTime}  (버스 한 대당 상태)
+let route = null, gen = 0, timer = null, firstFit = true, lastMeta = null;
+
+function setStatus(text, isErr = false) {
+  $("status").textContent = text;
+  $("status").className = isErr ? "err" : "";
+}
+
+function busIcon() {
+  return L.divIcon({
+    className: "bus", iconSize: [28, 28], iconAnchor: [14, 14],
+    html: '<div class="arrow"><svg viewBox="0 0 24 24"><path d="M12 2 L20 21 L12 17 L4 21 Z"/></svg></div>',
+  });
+}
+
+function stateOf(d) {
+  if (!d.isRunning) return "parked";
+  if (d.stopped === true) return "stopped";
+  if (d.stopped === false) return "moving";
+  return "unknown";
+}
+
+function styleBus(b) {
+  const d = b.data;
+  b.arrow.style.transform = `rotate(${d.bearing ?? 0}deg)`;
+  b.arrow.dataset.state = stateOf(d);
+  b.arrow.classList.toggle("nobearing", d.bearing == null);
+}
+
+const ageSec = (b) => Math.max(0, Math.round((Date.now() - b.dataTime) / 1000));
+
+function popupEl(b) {
+  const d = b.data, el = document.createElement("div");
+  const line = (text, bold) => {
+    const p = document.createElement(bold ? "b" : "div");
+    p.textContent = text; el.appendChild(p);
+    if (bold) el.appendChild(document.createElement("br"));
+  };
+  line(d.plate, true);
+  line(`Position from ${ageSec(b)} s ago`);
+  line(`Status: ${stateOf(d)}${d.snapped ? "" : " (not snapped to route)"}`);
+  if (d.bearing != null) line(`Heading: ${Math.round(d.bearing)}°`);
+  return el;
+}
+
+function applyData(list) {
+  const now = Date.now(), seen = new Set();
+  for (const d of list) {
+    seen.add(d.vehId);
+    const target = [d.lat, d.lng];
+    let b = buses.get(d.vehId);
+    if (!b) {
+      const marker = L.marker(target, { icon: busIcon(), keyboard: false }).addTo(map);
+      b = { marker, arrow: marker.getElement().querySelector(".arrow"), target, anim: null };
+      marker.bindPopup(() => popupEl(b));
+      buses.set(d.vehId, b);
+    } else if (b.target[0] !== target[0] || b.target[1] !== target[1]) {
+      const cur = b.marker.getLatLng();
+      b.anim = { from: [cur.lat, cur.lng], to: target, t0: now };
+      b.target = target;
+    }
+    b.data = d;
+    b.dataTime = now - (d.dataAgeSec ?? 0) * 1000;
+    styleBus(b);
+  }
+  for (const [id, b] of buses) {
+    if (!seen.has(id)) { b.marker.remove(); buses.delete(id); }
+  }
+  if (firstFit && buses.size) {
+    map.fitBounds(L.latLngBounds([...buses.values()].map((b) => b.target)),
+                  { padding: [40, 40], maxZoom: 15 });
+    firstFit = false;
+  }
+}
+
+// 이전 위치에서 새 위치까지 부드럽게 이동시킴
+function frame() {
+  const now = Date.now();
+  for (const b of buses.values()) {
+    if (!b.anim) continue;
+    const k = Math.min(1, (now - b.anim.t0) / MOVE_MS);
+    b.marker.setLatLng([
+      b.anim.from[0] + (b.anim.to[0] - b.anim.from[0]) * k,
+      b.anim.from[1] + (b.anim.to[1] - b.anim.from[1]) * k,
+    ]);
+    if (k === 1) b.anim = null;
+  }
+  requestAnimationFrame(frame);
+}
+
+function renderList() {
+  const box = $("list");
+  if (!route) return;
+  if (!buses.size) { box.innerHTML = '<div class="empty">No buses running.</div>'; return; }
+  box.replaceChildren(...[...buses.values()].map((b) => {
+    const item = document.createElement("div"); item.className = "item";
+    const plate = document.createElement("div"); plate.className = "plate"; plate.textContent = b.data.plate;
+    const meta = document.createElement("div"); meta.className = "meta";
+    meta.textContent = `${stateOf(b.data)} · ${ageSec(b)} s ago`;
+    item.append(plate, meta);
+    item.onclick = () => { map.flyTo(b.marker.getLatLng(), Math.max(map.getZoom(), 15)); b.marker.openPopup(); };
+    return item;
+  }));
+  for (const b of buses.values()) if (b.marker.isPopupOpen()) b.marker.getPopup().update();
+}
+
+function renderStatus() {
+  if (!lastMeta) return;
+  const age = lastMeta.ageSeconds + Math.round((Date.now() - lastMeta.at) / 1000);
+  setStatus(`Route ${route} · ${buses.size} buses · server data ${age} s old${lastMeta.stale ? " · STALE (API problem)" : ""}`,
+            lastMeta.stale);
+}
+
+async function poll(myGen) {
+  try {
+    const r = await fetch(`${API}/api/buses/${route}`);
+    if (myGen !== gen) return;
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(`${r.status} ${j.detail || ""}`.trim());
+    }
+    const j = await r.json();
+    if (myGen !== gen) return;
+    applyData(j.buses);
+    lastMeta = { ageSeconds: j.ageSeconds, stale: j.stale, at: Date.now() };
+    renderStatus(); renderList();
+  } catch (e) {
+    if (myGen !== gen) return;
+    const hint = e instanceof TypeError ? " (is the server running? is this page served from an allowed origin?)" : "";
+    setStatus(`Error: ${e.message}${hint}`, true);
+  } finally {
+    if (myGen === gen) timer = setTimeout(() => poll(myGen), POLL_MS);
+  }
+}
+
+function start(id) {
+  clearTimeout(timer); gen++;
+  for (const b of buses.values()) b.marker.remove();
+  buses.clear(); firstFit = true; lastMeta = null; route = id;
+  $("list").innerHTML = '<div class="empty">Loading…</div>';
+  setStatus(`Loading route ${id}…`);
+  try { localStorage.setItem("busRoute", id); } catch {}
+  poll(gen);
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const id = $("route").value.trim();
+  if (!/^[0-9]{9}$/.test(id)) { setStatus("Route ID must be exactly 9 digits.", true); return; }
+  start(id);
+});
+
+setInterval(() => { renderList(); renderStatus(); }, 1000);
+requestAnimationFrame(frame);
+
+let saved = "";
+try { saved = localStorage.getItem("busRoute") || ""; } catch {}
+const fromUrl = new URLSearchParams(location.search).get("route") || saved;
+if (/^[0-9]{9}$/.test(fromUrl)) { $("route").value = fromUrl; start(fromUrl); }
+</script>
+</body>
+</html>
