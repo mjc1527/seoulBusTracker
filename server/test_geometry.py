@@ -1,6 +1,6 @@
 import pytest
 
-from geometry import bearing_deg, distance_m
+from geometry import bearing_deg, distance_m, is_stopped
 
 
 def test_same_point_is_zero():
@@ -51,3 +51,23 @@ def test_bearing_is_between_0_and_360():
 def test_bearing_same_point_is_0():
     # 두 점이 같으면 0을 반환한다. (방향의 의미는 없다)
     assert bearing_deg(37.5, 127.0, 37.5, 127.0) == 0
+
+
+def test_stopped_same_point():
+    # 같은 좌표면 거리가 0이므로 정차다.
+    assert is_stopped(37.5, 127.0, 37.5, 127.0) is True
+
+
+def test_stopped_when_moved_less_than_threshold():
+    # 위도 0.00005도는 약 5.6 m다. 기준 10 m보다 짧으므로 정차다.
+    assert is_stopped(37.5, 127.0, 37.50005, 127.0) is True
+
+
+def test_not_stopped_when_moved_more_than_threshold():
+    # 위도 0.0005도는 약 55.6 m다. 기준 10 m보다 길므로 이동이다.
+    assert is_stopped(37.5, 127.0, 37.5005, 127.0) is False
+
+
+def test_stopped_uses_given_threshold():
+    # 같은 55.6 m라도 기준을 100 m로 주면 정차다.
+    assert is_stopped(37.5, 127.0, 37.5005, 127.0, threshold_m=100) is True
